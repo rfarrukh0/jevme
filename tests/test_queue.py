@@ -15,7 +15,7 @@ class FakeRouter:
         self.ran: list[str] = []
         self.delay = delay
 
-    def run_tool(self, name, args, label, prog):
+    def run_tool(self, name, args, label, prog, **kwargs):
         time.sleep(self.delay)
         self.ran.append(name)
 

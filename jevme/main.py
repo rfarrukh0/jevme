@@ -55,6 +55,9 @@ class AppDelegate(NSObject):
         self.generator = Generator(self.jev)
         log.info("codegen provider: %s", self.generator.provider)
         self.agent = Agent(self.jev, compose=compose_with_claude)
+        from . import workflows
+        self.workflow_store = workflows.WorkflowStore()
+        workflows.register_tools(self.workflow_store, self._run_workflow)
         # Ordered task queue: units run one at a time on a worker, so commands execute in the order
         # spoken even while the user keeps talking. Unit = ("tool", name, args, label) | ("route", clause).
         import collections
@@ -66,7 +69,8 @@ class AppDelegate(NSObject):
         self.router = Router(self.jev, on_preview=self._on_preview, on_action=self._on_action,
                              on_error=self._on_error, dispatch_main=dispatch_main, on_learn=self._on_learn,
                              on_general=self._on_general, on_cancel=self._on_cancel, on_plan=self._on_plan,
-                             on_commit=self._on_commit, on_stream=self._on_stream)
+                             on_commit=self._on_commit, on_stream=self._on_stream,
+                             on_completed=self._on_completed)
         self.router.agent = self.agent
         self.router.learn_now = self._run_learn
         from .watch import Watcher
@@ -180,6 +184,7 @@ class AppDelegate(NSObject):
         self._refresh_screen_vocab()
         self.router.tick()
         self.watcher.tick()
+        self._check_workflow_candidate()
         self.speech.maybe_roll_session(pending_empty=(self.router.pending_text() == ""))
 
     # ---------- callbacks ----------
@@ -285,8 +290,8 @@ class AppDelegate(NSObject):
             try:
                 kind = unit[0]
                 if kind == "tool":
-                    _, name, args, label = unit
-                    self.router.run_tool(name, args, label, prog)
+                    _, name, args, label, *rest = unit
+                    self.router.run_tool(name, args, label, prog, spoken=rest[0] if rest else "")
                     with self.task_lock:
                         more = bool(self.task_q)
                     if more and self.router.is_settle_tool(name):
@@ -303,8 +308,8 @@ class AppDelegate(NSObject):
         dispatch_main(self.overlay.clearPreview, ())
 
     @objc.python_method
-    def _on_commit(self, tool_name, args, label):
-        self._enqueue(("tool", tool_name, args, label))
+    def _on_commit(self, tool_name, args, label, spoken=""):
+        self._enqueue(("tool", tool_name, args, label, spoken))
 
     @objc.python_method
     def _on_stream(self, clause):
@@ -327,6 +332,50 @@ class AppDelegate(NSObject):
         self.agent.cancel()          # stops a running agent task; the agent resets this on its next run
         self.watcher.stop(save=False)  # "stop" also means: don't learn what I'm doing now
         self.overlay.flashError_("stopped")
+
+    @objc.python_method
+    def _on_completed(self, kind: str, spoken: str, data: dict):
+        """Persist only validated successful descriptors, on the ordered worker that observed success."""
+        if not config.WORKFLOW_LEARNING:
+            return
+        from . import workflows
+        if kind == "tool":
+            unit = workflows.tool_unit(data["tool_name"], data.get("args", {}))
+        else:
+            from .ui_memory import RecipeStep
+            try:
+                steps = [RecipeStep(**step) for step in data.get("steps", [])]
+            except (TypeError, ValueError):
+                return
+            unit = workflows.recipe_unit(data.get("goal", spoken), data.get("app0", ""), steps)
+        if unit is None:
+            return
+        self.workflow_store.record(unit)
+
+    @objc.python_method
+    def _check_workflow_candidate(self):
+        if not config.WORKFLOW_LEARNING or not getattr(self, "workflow_store", None):
+            return
+        candidate = self.workflow_store.finalize_candidate()
+        if candidate:
+            self.overlay.flashAction_(
+                f"routine detected: {candidate.summary[:80]} · say ‘save workflow as …’")
+
+    @objc.python_method
+    def _run_workflow(self, name: str) -> str:
+        """Run a saved workflow inside the current queue unit, preserving order and cancel epochs."""
+        from .workflows import WorkflowRunner
+        epoch = self.cancel_epoch
+        self.agent.cancelled = False
+        progress = lambda s: dispatch_main(self.overlay.setPreview_, (s,))
+        runner = WorkflowRunner(
+            self.workflow_store,
+            run_tool=lambda tool, args, label, record=False: self.router.run_tool(
+                tool, args, label, progress, record=record),
+            replay_recipe=lambda key, prog: self.agent.replay_recipe_key(key, prog),
+            cancelled=lambda: epoch != self.cancel_epoch or self.agent.cancelled,
+        )
+        return runner.run(name, progress)
 
     @objc.python_method
     def _refresh_screen_vocab(self):

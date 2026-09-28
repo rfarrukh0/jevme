@@ -169,6 +169,26 @@ def test_risky_learned_tool_confirms_every_run():
         T.BY_NAME.pop(tool.name, None)
 
 
+def test_only_successful_tools_emit_completed_events():
+    h = Harness(FakeJev({}))
+    completed = []
+    h.router.on_completed = lambda kind, spoken, data: completed.append((kind, spoken, data))
+    tool = T.BY_NAME["media_next"]
+    old_run = tool.run
+    try:
+        tool.run = lambda args: "Skipped"
+        assert h.router.run_tool("media_next", {}, "next", lambda label: None, spoken="skip this")
+        assert completed == [("tool", "skip this", {"tool_name": "media_next", "args": {}})]
+
+        def fail(args):
+            raise RuntimeError("no player")
+        tool.run = fail
+        assert not h.router.run_tool("media_next", {}, "next", lambda label: None, spoken="skip again")
+        assert len(completed) == 1
+    finally:
+        tool.run = old_run
+
+
 # ---------- cursor survives STT revisions (logged: "o Code", "s tab close this") ----------
 
 def _router():
