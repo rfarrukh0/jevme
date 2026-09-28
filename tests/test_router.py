@@ -229,6 +229,36 @@ def test_workflow_registration_uses_real_tool_catalog(tmp_path):
         T.BY_NAME.update(original_by_name)
 
 
+def test_workflow_save_persistence_error_is_reported_as_tool_failure(tmp_path, monkeypatch):
+    from jevme.workflows import WorkflowCandidate, WorkflowStore, register_tools, tool_unit
+
+    slack = tool_unit("open_app", {"app": "Slack"})
+    jira = tool_unit("open_app", {"app": "Jira"})
+    assert slack is not None and jira is not None
+    store = WorkflowStore(tmp_path / "workflows.json")
+    store.pending = WorkflowCandidate((slack, jira), 3)
+    monkeypatch.setattr(store, "save", lambda: False)
+    harness = Harness(FakeJev({}))
+    original_tools, original_by_name = list(T.TOOLS), dict(T.BY_NAME)
+
+    class FakeVocab:
+        @staticmethod
+        def learn(*names):
+            pass
+
+    try:
+        register_tools(store, lambda name: "done", tools_module=T, vocab_module=FakeVocab)
+        assert not harness.router.run_tool(
+            "save_workflow", {"name": "morning"}, "save workflow", lambda label: None)
+        assert store.pending is not None
+        assert store.by_name("morning") is None
+        assert harness.events[-1] == ("error", "save_workflow: Couldn't save workflow")
+    finally:
+        T.TOOLS[:] = original_tools
+        T.BY_NAME.clear()
+        T.BY_NAME.update(original_by_name)
+
+
 # ---------- cursor survives STT revisions (logged: "o Code", "s tab close this") ----------
 
 def _router():
