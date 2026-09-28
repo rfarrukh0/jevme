@@ -233,8 +233,8 @@ runs its tools and live-tree recipes in order. Detection uses only successful re
 bounded into short activity episodes, and survives restarts in `~/.config/jevme/workflows.json`.
 
 Workflow learning never watches global input. It excludes typed content, volatile messaging, consequential
-actions, failed tasks, and workflow replays themselves. Set `JEVME_WORKFLOW_LEARNING=0` to disable mining and
-suggestions without disabling workflows you already saved.
+actions, failed tasks, and workflow replays themselves. Mining is off by default; set
+`JEVME_WORKFLOW_LEARNING=1` to opt in. Disabling it does not disable workflows you already saved.
 
 ### Learning from demonstration (`jevme/watch.py`)
 
@@ -291,7 +291,7 @@ Models are configurable: `JEVME_VISION_MODEL`, `JEVME_CODEGEN_MODEL` (see `.env.
 
 All optional, via `.env` or environment: `JEVME_COMMIT_CONFIDENCE` (0.80), `JEVME_STABLE_PARTIALS` (2),
 `JEVME_TEXT_PAUSE_S` (0.65), `JEVME_LOCALE` (en-US), `JEVME_SCREEN_VOCAB` (1),
-`JEVME_WORKFLOW_LEARNING` (1), `JEVME_VISION_MODEL`, `JEVME_CODEGEN_MODEL`, `JEVME_LOG`.
+`JEVME_WORKFLOW_LEARNING` (0), `JEVME_VISION_MODEL`, `JEVME_CODEGEN_MODEL`, `JEVME_LOG`.
 
 ## Project layout
 

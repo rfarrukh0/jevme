@@ -364,14 +364,18 @@ class WorkflowStore:
         now = time.time() if now is None else now
         with self._lock:
             last = self.history[-1] if self.history else None
-            episode = last.episode if last and now - last.timestamp <= EPISODE_IDLE_S else (
+            new_episode = bool(last and now - last.timestamp > EPISODE_IDLE_S)
+            episode = last.episode if last and not new_episode else (
                 last.episode + 1 if last else 1)
             self.history.append(HistoryEvent(unit, now, episode))
             self.history = self.history[-MAX_HISTORY_EVENTS:]
             self.dismissed = dict(sorted(
                 ((sig, when) for sig, when in self.dismissed.items() if now - when < DISMISS_FOR_S),
                 key=lambda item: item[1], reverse=True)[:MAX_DISMISSED])
-            self.save()
+            # Persist on the episode boundary, not after every command on the ordered worker.
+            # finalize_candidate() persists the last episode once it becomes idle.
+            if new_episode:
+                self.save()
 
     def finalize_candidate(self, now: float | None = None) -> WorkflowCandidate | None:
         """Publish after idle so an A-B prefix cannot pre-empt A-B-C."""
@@ -396,8 +400,8 @@ class WorkflowStore:
                 self.pending = found
                 self.save()
                 return found
-            if changed:
-                self.save()
+            # This is also the persistence boundary for an episode with no candidate.
+            self.save()
             return None
 
     def _mine(self, now: float) -> WorkflowCandidate | None:
@@ -554,7 +558,10 @@ def register_tools(store: WorkflowStore, run_workflow: Callable[[str], str], *,
         return message
 
     def run(values: dict[str, str]) -> str:
-        return run_workflow(values.get("workflow", ""))
+        name = values.get("workflow", "")
+        if name in ("", "__none__"):
+            return "No workflows have been saved yet"
+        return run_workflow(name)
 
     specs = [
         tools_module.Tool("save_workflow", "Name and save the repeated routine Jevme most recently suggested.",

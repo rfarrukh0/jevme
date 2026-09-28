@@ -189,6 +189,46 @@ def test_only_successful_tools_emit_completed_events():
         tool.run = old_run
 
 
+def test_suppressed_keystroke_tool_reports_failure(monkeypatch):
+    h = Harness(FakeJev({}))
+    completed = []
+    h.router.on_completed = lambda *event: completed.append(event)
+    monkeypatch.setattr(T.A, "keystroke", lambda *args: False)
+    assert not h.router.run_tool("new_tab", {}, "new tab", lambda label: None)
+    assert completed == []
+
+
+def test_workflow_registration_uses_real_tool_catalog(tmp_path):
+    from jevme.workflows import Workflow, WorkflowStore, register_tools, tool_unit
+
+    slack = tool_unit("open_app", {"app": "Slack"})
+    jira = tool_unit("open_app", {"app": "Jira"})
+    assert slack is not None and jira is not None
+    store = WorkflowStore(tmp_path / "workflows.json")
+    store.workflows.append(Workflow("morning", "Morning Routine", (slack, jira)))
+    original_tools, original_by_name = list(T.TOOLS), dict(T.BY_NAME)
+    learned, ran = [], []
+
+    class FakeVocab:
+        @staticmethod
+        def learn(*names):
+            learned.extend(names)
+
+    try:
+        register_tools(store, lambda name: ran.append(name) or "done",
+                       tools_module=T, vocab_module=FakeVocab)
+        save_tool, run_tool = T.BY_NAME["save_workflow"], T.BY_NAME["run_workflow"]
+        assert isinstance(save_tool, T.Tool) and isinstance(run_tool, T.Tool)
+        assert save_tool.text_arg is not None and save_tool.text_arg.name == "name"
+        assert run_tool.enum_args[0].options() == {"Morning Routine": None}
+        assert run_tool.run({"workflow": "Morning Routine"}) == "done"
+        assert learned == ["Morning Routine"] and ran == ["Morning Routine"]
+    finally:
+        T.TOOLS[:] = original_tools
+        T.BY_NAME.clear()
+        T.BY_NAME.update(original_by_name)
+
+
 # ---------- cursor survives STT revisions (logged: "o Code", "s tab close this") ----------
 
 def _router():

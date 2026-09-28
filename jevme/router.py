@@ -147,7 +147,7 @@ class Router:
         self.on_general = on_general
         self.on_cancel = on_cancel
         self.on_plan = on_plan
-        self.on_commit = on_commit        # (tool_name, args, label): main enqueues; harness records
+        self.on_commit = on_commit        # (tool_name, args, label, spoken): main enqueues; harness records
         self.on_stream = on_stream        # (clause): a completed leading clause, fired mid-sentence
         self.on_completed = on_completed  # successful, safe top-level work for workflow mining
         self.agent = None                 # set by main: executes general clauses

@@ -237,15 +237,16 @@ KEY_CODES = {"enter": 36, "return": 36, "escape": 53, "tab": 48, "space": 49, "d
              "home": 115, "end": 119}
 
 
-def keystroke(key: str, *mods: str) -> None:
+def keystroke(key: str, *mods: str) -> bool:
     if not _key_guard():
-        raise RuntimeError("keystroke suppressed by rate guard")
+        return False
     using = ", ".join(MODS[m] for m in mods)
     using_clause = f" using {{{using}}}" if using else ""
     if key in KEY_CODES:
         osascript(f'tell application "System Events" to key code {KEY_CODES[key]}{using_clause}')
     else:
         osascript(f'tell application "System Events" to keystroke "{esc(key)}"{using_clause}')
+    return True
 
 
 def type_text(text: str) -> None:

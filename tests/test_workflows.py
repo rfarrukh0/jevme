@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from types import SimpleNamespace
 
@@ -59,16 +60,41 @@ def test_candidate_waits_for_idle_and_chooses_longest_across_restart(tmp_path):
     start = time.time()
     routine = [unit("Slack"), unit("Jira"), unit("Calendar")]
     store = WorkflowStore(path)
-    last = repeat(store, routine, start=start)
-    assert store.pending is None  # no A-B prefix is surfaced while A-B-C can still continue
+    last = start
+    for occurrence in range(MIN_OCCURRENCES - 1):
+        base = start + occurrence * (EPISODE_IDLE_S + len(routine) + 2)
+        for offset, item in enumerate(routine):
+            last = base + offset
+            store.record(item, last)
+        assert finish(store, last) is None
 
-    store = WorkflowStore(path)
+    store = WorkflowStore(path)  # persisted episodes survive an application restart
+    base = start + (MIN_OCCURRENCES - 1) * (EPISODE_IDLE_S + len(routine) + 2)
+    for offset, item in enumerate(routine):
+        last = base + offset
+        store.record(item, last)
+    assert store.pending is None  # no A-B prefix is surfaced while A-B-C can still continue
     found = finish(store, last)
     assert found is not None
     assert found.units == tuple(routine)
     assert found.occurrences == MIN_OCCURRENCES
     loaded = WorkflowStore(path)
     assert loaded.pending is not None and loaded.pending.signature == found.signature
+
+
+def test_history_saves_at_episode_boundaries_not_after_every_unit(tmp_path, monkeypatch):
+    store = WorkflowStore(tmp_path / "w.json")
+    saves = []
+    monkeypatch.setattr(store, "save", lambda: saves.append(True) or True)
+    start = time.time()
+    store.record(unit("Slack"), start)
+    store.record(unit("Jira"), start + 1)
+    store.record(unit("Calendar"), start + 2)
+    assert saves == []
+    store.record(unit("Notes"), start + EPISODE_IDLE_S + 3)
+    assert saves == [True]
+    store.finalize_candidate(start + EPISODE_IDLE_S * 2 + 4)
+    assert saves == [True, True]
 
 
 def test_episode_boundaries_and_overlaps_do_not_create_false_candidates(tmp_path):
@@ -256,6 +282,40 @@ def test_recipe_failure_and_cancellation_stop_without_counting_completion(tmp_pa
     assert store.workflows[0].hits == 0
 
 
+def test_cancellation_during_a_step_prevents_the_next_step(tmp_path):
+    store = WorkflowStore(tmp_path / "w.json")
+    workflow = Workflow("cancel", "cancel", (unit("Slack"), unit("Jira")))
+    store.workflows.append(workflow)
+    started, release, cancelled = threading.Event(), threading.Event(), threading.Event()
+    calls, errors = [], []
+
+    def run_tool(name, args, label, record):
+        calls.append(args["app"])
+        started.set()
+        release.wait(timeout=2)
+        return True
+
+    runner = WorkflowRunner(store, run_tool=run_tool, replay_recipe=lambda *args: True,
+                            cancelled=cancelled.is_set)
+    worker = threading.Thread(target=lambda: _capture_error(errors, runner.run, "cancel"))
+    worker.start()
+    assert started.wait(timeout=2)
+    cancelled.set()
+    release.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert calls == ["Slack"]
+    assert len(errors) == 1 and "cancelled" in str(errors[0])
+    assert workflow.hits == 0
+
+
+def _capture_error(errors, function, *args):
+    try:
+        function(*args)
+    except Exception as error:  # noqa: BLE001 - thread transports the exception to the test
+        errors.append(error)
+
+
 def test_startup_reload_and_dynamic_registration(tmp_path):
     path = tmp_path / "w.json"
     data = {"version": SCHEMA_VERSION,
@@ -265,8 +325,11 @@ def test_startup_reload_and_dynamic_registration(tmp_path):
     store = WorkflowStore(path)
 
     class FakeTool:
-        def __init__(self, name, description, examples, run, **kwargs):
-            self.name, self.run, self.kwargs = name, run, kwargs
+        def __init__(self, name, description, examples, run, *, enum_args=None, text_arg=None,
+                     not_for=None, instant=True):
+            self.name, self.run = name, run
+            self.enum_args, self.text_arg = enum_args or [], text_arg
+            self.not_for, self.instant = not_for, instant
 
     fake_tools = SimpleNamespace(Tool=FakeTool,
                                  TextArg=lambda *args, **kwargs: (args, kwargs),
@@ -281,3 +344,5 @@ def test_startup_reload_and_dynamic_registration(tmp_path):
     assert learned == ["Morning Routine"]
     assert fake_tools.BY_NAME["run_workflow"].run({"workflow": "Morning Routine"}) == "done"
     assert ran == ["Morning Routine"]
+    assert fake_tools.BY_NAME["run_workflow"].run({"workflow": "__none__"}) == (
+        "No workflows have been saved yet")
