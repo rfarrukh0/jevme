@@ -80,3 +80,18 @@ def test_workflow_recipe_is_revalidated_immediately_before_replay(monkeypatch):
     agent = G.Agent.__new__(G.Agent)
     agent.replay_steps = lambda *args, **kwargs: pytest.fail("ineligible recipe was replayed")
     assert not agent.replay_recipe_key(key)
+
+
+def test_workflow_recipe_reference_resolves_after_steps_are_refreshed(monkeypatch):
+    original = [ui_memory.RecipeStep("open_app", arg="Notes"),
+                ui_memory.RecipeStep("click", role="AXButton", label="New Note")]
+    recipe = ui_memory.Recipe("open notes and create a note", "Finder", original)
+    key = workflows.recipe_key(recipe.goal, recipe.app0, recipe.steps)
+    recipe.steps = [ui_memory.RecipeStep("open_app", arg="Notes"),
+                    ui_memory.RecipeStep("menu", label="New Note", arg="File > New Note")]
+    monkeypatch.setattr(ui_memory, "task_memory", lambda: type("Memory", (), {"all": lambda self: [recipe]})())
+    replayed = []
+    agent = G.Agent.__new__(G.Agent)
+    agent.replay_steps = lambda *args, **kwargs: replayed.append(args[2]) or True
+    assert agent.replay_recipe_key(key)
+    assert replayed == [recipe.steps]

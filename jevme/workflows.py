@@ -8,7 +8,7 @@ import math
 import re
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -67,8 +67,13 @@ def _finite_number(value: Any, *, minimum: float = 0) -> float:
 
 
 def recipe_key(goal: str, app0: str, steps: list[ui_memory.RecipeStep]) -> str:
-    """Return an opaque reference to an existing task-memory recipe."""
-    raw = {"goal": goal, "app0": app0, "steps": [asdict(step) for step in steps]}
+    """Return an opaque stable reference to a task-memory recipe identity.
+
+    TaskMemory updates the steps of an existing (normalized goal, app) recipe in place, so steps
+    deliberately do not participate in this key. Replay resolves the current steps and revalidates them.
+    """
+    del steps
+    raw = {"goal": ui_memory._norm(goal), "app0": _clean_text(app0, 80)}
     payload = json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
 
@@ -277,6 +282,15 @@ class WorkflowStore:
                 except (KeyError, TypeError, ValueError, OverflowError):
                     log.warning("skipping malformed workflow history entry")
 
+        try:
+            finalized = int(data.get("finalized_episode", 0))
+            newest_episode = self.history[-1].episode if self.history else 0
+            if not 0 <= finalized <= newest_episode:
+                raise ValueError("invalid finalized episode")
+            self._finalized_episode = finalized
+        except (TypeError, ValueError, OverflowError):
+            log.warning("ignoring malformed finalized episode")
+
         raw_pending = data.get("pending")
         if raw_pending is not None:
             try:
@@ -340,6 +354,7 @@ class WorkflowStore:
                          "episode": event.episode} for event in self.history[-MAX_HISTORY_EVENTS:]],
             "pending": pending,
             "dismissed": dict(list(self.dismissed.items())[:MAX_DISMISSED]),
+            "finalized_episode": self._finalized_episode,
         }
 
     def save(self) -> bool:
@@ -404,8 +419,18 @@ class WorkflowStore:
             self.save()
             return None
 
+    def needs_finalization(self, now: float | None = None) -> bool:
+        """Cheap timer-thread gate before dispatching mining and persistence to a worker."""
+        now = time.time() if now is None else now
+        with self._lock:
+            if self.pending and now - self.pending.detected > PENDING_TTL_S:
+                return True
+            return bool(self.history and now - self.history[-1].timestamp > EPISODE_IDLE_S
+                        and self.history[-1].episode != self._finalized_episode)
+
     def _mine(self, now: float) -> WorkflowCandidate | None:
         saved = [[unit.signature() for unit in workflow.units] for workflow in self.workflows]
+        event_signatures = [event.unit.signature() for event in self.history]
         for length in range(MAX_WORKFLOW_UNITS, MIN_WORKFLOW_UNITS - 1, -1):
             winners: list[tuple[int, WorkflowCandidate]] = []
             seen: set[str] = set()
@@ -414,8 +439,8 @@ class WorkflowStore:
                 if window[0].episode != window[-1].episode:
                     continue
                 units = tuple(event.unit for event in window)
-                signature = _sequence_signature(units)
-                unit_signatures = [unit.signature() for unit in units]
+                unit_signatures = event_signatures[start:start + length]
+                signature = json.dumps(unit_signatures, separators=(",", ":"))
                 covered = any(any(existing[i:i + length] == unit_signatures
                                   for i in range(len(existing) - length + 1)) for existing in saved)
                 if signature in seen or covered or signature in self.dismissed:
@@ -424,19 +449,24 @@ class WorkflowStore:
                 if len(set(unit_signatures)) < 2 or all(
                         unit.kind == "tool" and unit.tool_name in _NOISE_TOOLS for unit in units):
                     continue
-                occurrences, last_end = self._occurrence_stats(units)
+                occurrences, last_end = self._occurrence_stats(
+                    units, event_signatures, wanted_signatures=unit_signatures)
                 if occurrences >= MIN_OCCURRENCES:
                     winners.append((last_end, WorkflowCandidate(units, occurrences, now)))
             if winners:
                 return max(winners, key=lambda item: (item[0], item[1].occurrences))[1]
         return None
 
-    def _occurrence_stats(self, units: tuple[WorkflowUnit, ...]) -> tuple[int, int]:
-        wanted, count, index, last_end = [unit.signature() for unit in units], 0, 0, -1
+    def _occurrence_stats(self, units: tuple[WorkflowUnit, ...],
+                          event_signatures: list[str] | None = None, *,
+                          wanted_signatures: list[str] | None = None) -> tuple[int, int]:
+        wanted = wanted_signatures or [unit.signature() for unit in units]
+        count, index, last_end = 0, 0, -1
+        signatures = event_signatures or [event.unit.signature() for event in self.history]
         while index <= len(self.history) - len(wanted):
             chunk = self.history[index:index + len(wanted)]
             if (chunk[0].episode == chunk[-1].episode
-                    and [event.unit.signature() for event in chunk] == wanted):
+                    and signatures[index:index + len(wanted)] == wanted):
                 count += 1
                 last_end = index + len(wanted)
                 index += len(wanted)
@@ -510,11 +540,13 @@ class WorkflowStore:
 
 class WorkflowRunner:
     def __init__(self, store: WorkflowStore, *, run_tool: Callable[..., bool],
-                 replay_recipe: Callable[..., bool], cancelled: Callable[[], bool]) -> None:
+                 replay_recipe: Callable[..., bool], cancelled: Callable[[], bool],
+                 settle_tool: Callable[[str], None] | None = None) -> None:
         self.store = store
         self.run_tool = run_tool
         self.replay_recipe = replay_recipe
         self.cancelled = cancelled
+        self.settle_tool = settle_tool
 
     def run(self, name: str, progress: Callable[[str], None] | None = None) -> str:
         workflow = self.store.by_name(name)
@@ -536,6 +568,8 @@ class WorkflowRunner:
                 ok = False
             if not ok:
                 raise RuntimeError(f"workflow stopped at step {index}: {unit.label}")
+            if index < len(workflow.units) and unit.kind == "tool" and self.settle_tool:
+                self.settle_tool(unit.tool_name)
         self.store.hit(workflow)
         return f"Finished workflow: {workflow.name}"
 
@@ -551,29 +585,35 @@ def register_tools(store: WorkflowStore, run_workflow: Callable[[str], str], *,
     if store.workflows:
         vocab_module.learn(*(workflow.name for workflow in store.workflows))
 
-    def save(values: dict[str, str]) -> str:
-        workflow, message = store.save_pending(values.get("name", ""))
-        if workflow:
-            vocab_module.learn(workflow.name)
-        return message
-
     def run(values: dict[str, str]) -> str:
         name = values.get("workflow", "")
-        if name in ("", "__none__"):
-            return "No workflows have been saved yet"
         return run_workflow(name)
 
-    specs = [
-        tools_module.Tool("save_workflow", "Name and save the repeated routine Jevme most recently suggested.",
-                          ["save workflow as morning standup", "call this workflow morning standup"], run=save,
-                          text_arg=tools_module.TextArg("name", "The exact name for the pending workflow."),
-                          instant=False),
-        tools_module.Tool("run_workflow", "Run one explicitly saved workflow from start to finish.",
-                          ["run morning standup", "start morning standup"], run=run,
-                          enum_args=[tools_module.EnumArg("workflow", "Which saved workflow?", store.names)]),
-    ]
-    for tool in specs:
+    def install(tool: Any) -> None:
         if tool.name in tools_module.BY_NAME:
             tools_module.TOOLS[:] = [old for old in tools_module.TOOLS if old.name != tool.name]
         tools_module.TOOLS.append(tool)
         tools_module.BY_NAME[tool.name] = tool
+
+    def install_run_tool() -> None:
+        install(tools_module.Tool(
+            "run_workflow", "Run one explicitly saved workflow from start to finish.",
+            ["run morning standup", "start morning standup"], run=run,
+            enum_args=[tools_module.EnumArg("workflow", "Which saved workflow?", store.names)]))
+
+    def save(values: dict[str, str]) -> str:
+        workflow, message = store.save_pending(values.get("name", ""))
+        if workflow:
+            vocab_module.learn(workflow.name)
+            install_run_tool()
+        return message
+
+    install(tools_module.Tool(
+        "save_workflow", "Name and save the repeated routine Jevme most recently suggested.",
+        ["save workflow as morning standup", "call this workflow morning standup"], run=save,
+        text_arg=tools_module.TextArg("name", "The exact name for the pending workflow."), instant=False))
+    if store.workflows:
+        install_run_tool()
+    elif "run_workflow" in tools_module.BY_NAME:
+        tools_module.TOOLS[:] = [old for old in tools_module.TOOLS if old.name != "run_workflow"]
+        tools_module.BY_NAME.pop("run_workflow", None)

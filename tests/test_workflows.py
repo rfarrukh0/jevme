@@ -11,6 +11,7 @@ import pytest
 from jevme import config, ui_memory
 from jevme.workflows import (
     EPISODE_IDLE_S,
+    HistoryEvent,
     MAX_DISMISSED,
     MAX_WORKFLOWS,
     MIN_OCCURRENCES,
@@ -25,6 +26,7 @@ from jevme.workflows import (
     eligible_recipe,
     eligible_tool,
     recipe_unit,
+    recipe_key,
     register_tools,
     tool_unit,
 )
@@ -167,6 +169,45 @@ def test_recipe_persistence_is_an_opaque_reference_only(tmp_path):
         assert private not in serialized
 
 
+def test_recipe_reference_survives_task_memory_step_updates():
+    goal = "Open notes and create a note"
+    original = [ui_memory.RecipeStep("open_app", arg="Notes"),
+                ui_memory.RecipeStep("click", role="AXButton", label="New Note")]
+    updated = [ui_memory.RecipeStep("open_app", arg="Notes"),
+               ui_memory.RecipeStep("menu", label="New Note", arg="File > New Note")]
+    assert recipe_key(goal, "Finder", original) == recipe_key(goal.lower(), "Finder", updated)
+    assert recipe_key("open calendar", "Finder", updated) != recipe_key(goal, "Finder", updated)
+
+
+def test_finalized_episode_survives_restart_and_avoids_remining(tmp_path, monkeypatch):
+    path = tmp_path / "w.json"
+    store = WorkflowStore(path)
+    start = time.time()
+    store.record(unit("Slack"), start)
+    store.record(unit("Jira"), start + 1)
+    assert store.finalize_candidate(start + EPISODE_IDLE_S + 2) is None
+    loaded = WorkflowStore(path)
+    assert loaded._finalized_episode == loaded.history[-1].episode
+    monkeypatch.setattr(loaded, "_mine", lambda now: pytest.fail("finalized history was mined again"))
+    assert loaded.finalize_candidate(start + EPISODE_IDLE_S + 3) is None
+
+
+def test_miner_serializes_each_history_event_only_once(tmp_path, monkeypatch):
+    store = WorkflowStore(tmp_path / "w.json")
+    store.history = [HistoryEvent(unit(f"App {index}"), float(index), index // 6 + 1)
+                     for index in range(240)]
+    original, calls = WorkflowUnit.signature, 0
+
+    def counted(item):
+        nonlocal calls
+        calls += 1
+        return original(item)
+
+    monkeypatch.setattr(WorkflowUnit, "signature", counted)
+    assert store._mine(time.time()) is None
+    assert calls == len(store.history)
+
+
 def test_save_collisions_duplicates_and_persistence_failure(tmp_path, monkeypatch):
     store = WorkflowStore(tmp_path / "w.json")
     start = time.time()
@@ -251,11 +292,14 @@ def test_workflow_replay_does_not_train_itself_and_disabled_mining_still_runs(tm
     store.workflows.append(workflow)
     calls = []
     monkeypatch.setattr(config, "WORKFLOW_LEARNING", False)
+    settled = []
     runner = WorkflowRunner(store,
                             run_tool=lambda name, args, label, record: calls.append(record) or True,
-                            replay_recipe=lambda *args: True, cancelled=lambda: False)
+                            replay_recipe=lambda *args: True, cancelled=lambda: False,
+                            settle_tool=settled.append)
     assert runner.run("morning") == "Finished workflow: morning"
     assert calls == [False, False]
+    assert settled == ["open_app"]  # settle after the first unit, never after the final unit
     assert store.history == []
     assert workflow.hits == 1
 
@@ -344,5 +388,26 @@ def test_startup_reload_and_dynamic_registration(tmp_path):
     assert learned == ["Morning Routine"]
     assert fake_tools.BY_NAME["run_workflow"].run({"workflow": "Morning Routine"}) == "done"
     assert ran == ["Morning Routine"]
-    assert fake_tools.BY_NAME["run_workflow"].run({"workflow": "__none__"}) == (
-        "No workflows have been saved yet")
+
+
+def test_run_tool_is_registered_only_after_first_workflow_is_saved(tmp_path):
+    store = WorkflowStore(tmp_path / "w.json")
+
+    class FakeTool:
+        def __init__(self, name, description, examples, run, *, enum_args=None, text_arg=None,
+                     not_for=None, instant=True):
+            self.name, self.run = name, run
+            self.enum_args, self.text_arg = enum_args or [], text_arg
+
+    fake_tools = SimpleNamespace(Tool=FakeTool,
+                                 TextArg=lambda *args, **kwargs: (args, kwargs),
+                                 EnumArg=lambda *args, **kwargs: (args, kwargs),
+                                 TOOLS=[], BY_NAME={})
+    fake_vocab = SimpleNamespace(learn=lambda *names: None)
+    register_tools(store, lambda name: "done", tools_module=fake_tools, vocab_module=fake_vocab)
+    assert set(fake_tools.BY_NAME) == {"save_workflow"}
+
+    store.pending = WorkflowCandidate((unit("Slack"), unit("Jira")), MIN_OCCURRENCES)
+    assert fake_tools.BY_NAME["save_workflow"].run({"name": "morning"}) == "Saved workflow: morning"
+    assert set(fake_tools.BY_NAME) == {"save_workflow", "run_workflow"}
+    assert fake_tools.BY_NAME["run_workflow"].enum_args[0][0][2]() == {"morning": None}

@@ -158,6 +158,12 @@ class AppDelegate(NSObject):
             self.overlay.setTranscript_("")
             self.menu_toggle.setTitle_("Pause listening")
 
+    def applicationWillTerminate_(self, note):
+        """Persist the current workflow episode even before its idle boundary."""
+        store = getattr(self, "workflow_store", None)
+        if store:
+            store.save()
+
     def tick_(self, timer):
         if not getattr(self, "listening", False):
             return
@@ -287,6 +293,9 @@ class AppDelegate(NSObject):
                 epoch, unit = self.task_q.popleft()
             if epoch != self.cancel_epoch:
                 continue
+            # Preserve the epoch that admitted this queue unit. A concurrent stop must not become
+            # invisible if run_workflow begins after cancel_epoch advances.
+            self._active_epoch = epoch
             try:
                 kind = unit[0]
                 if kind == "tool":
@@ -305,6 +314,9 @@ class AppDelegate(NSObject):
             except Exception as e:  # noqa: BLE001
                 log.exception("task failed")
                 dispatch_main(self.overlay.flashError_, (str(e)[:50],))
+            finally:
+                if getattr(self, "_active_epoch", None) == epoch:
+                    self._active_epoch = None
         dispatch_main(self.overlay.clearPreview, ())
 
     @objc.python_method
@@ -354,18 +366,43 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def _check_workflow_candidate(self):
-        if not config.WORKFLOW_LEARNING or not getattr(self, "workflow_store", None):
+        if (not config.WORKFLOW_LEARNING or not getattr(self, "workflow_store", None)
+                or getattr(self, "_workflow_check_busy", False)):
             return
-        candidate = self.workflow_store.finalize_candidate()
+        if not self.workflow_store.needs_finalization():
+            return
+        self._workflow_check_busy = True
+
+        def work():
+            candidate = None
+            try:
+                candidate = self.workflow_store.finalize_candidate()
+            except Exception:  # noqa: BLE001
+                log.exception("workflow candidate check failed")
+            dispatch_main(self._workflow_candidate_ready, (candidate,))
+
+        threading.Thread(target=work, daemon=True, name="workflow-miner").start()
+
+    @objc.python_method
+    def _workflow_candidate_ready(self, candidate):
+        self._workflow_check_busy = False
         if candidate:
             self.overlay.flashAction_(
                 f"routine detected: {candidate.summary[:80]} · say ‘save workflow as …’")
 
     @objc.python_method
+    def _settle_workflow_tool(self, name: str):
+        if self.router.is_settle_tool(name):
+            from . import see
+            see.wait_for_screen(timeout=4.0)
+            time.sleep(0.2)
+
+    @objc.python_method
     def _run_workflow(self, name: str) -> str:
         """Run a saved workflow inside the current queue unit, preserving order and cancel epochs."""
         from .workflows import WorkflowRunner
-        epoch = self.cancel_epoch
+        active_epoch = getattr(self, "_active_epoch", None)
+        epoch = self.cancel_epoch if active_epoch is None else active_epoch
         self.agent.cancelled = False
         progress = lambda s: dispatch_main(self.overlay.setPreview_, (s,))
         runner = WorkflowRunner(
@@ -374,6 +411,7 @@ class AppDelegate(NSObject):
                 tool, args, label, progress, record=record),
             replay_recipe=lambda key, prog: self.agent.replay_recipe_key(key, prog),
             cancelled=lambda: epoch != self.cancel_epoch or self.agent.cancelled,
+            settle_tool=self._settle_workflow_tool,
         )
         return runner.run(name, progress)
 
