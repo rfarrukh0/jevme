@@ -194,8 +194,14 @@ def test_suppressed_keystroke_tool_reports_failure(monkeypatch):
     completed = []
     h.router.on_completed = lambda *event: completed.append(event)
     monkeypatch.setattr(T.A, "keystroke", lambda *args: False)
-    assert not h.router.run_tool("new_tab", {}, "new tab", lambda label: None)
-    assert completed == []
+    tool, old_run = T.BY_NAME["new_tab"], T.BY_NAME["new_tab"].run
+    try:
+        # Harness stubs every tool callback; restore this tool's real execution boundary for the test.
+        tool.run = lambda args: T._keystroke("New tab", "t", "cmd")
+        assert not h.router.run_tool("new_tab", {}, "new tab", lambda label: None)
+        assert completed == []
+    finally:
+        tool.run = old_run
 
 
 def test_workflow_registration_uses_real_tool_catalog(tmp_path):
